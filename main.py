@@ -3,13 +3,13 @@ import uuid
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
-from pathlib import Path
 from contextlib import asynccontextmanager
+import io
 
 import pandas as pd
 import httpx
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pymongo import MongoClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -23,14 +23,7 @@ logger = logging.getLogger(__name__)
 class Config:
     MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     DATABASE_NAME = os.getenv("DATABASE_NAME", "excel_processor")
-    UPLOAD_DIR = Path("uploads")
-    PROCESSED_DIR = Path("processed")
     MAX_PROCESSING_TIME = 120  # 2 minutes in seconds
-    
-    def __init__(self):
-        # Create directories if they don't exist
-        self.UPLOAD_DIR.mkdir(exist_ok=True)
-        self.PROCESSED_DIR.mkdir(exist_ok=True)
 
 config = Config()
 
@@ -78,7 +71,7 @@ class JobRecord:
         self.status = status
         self.created_at = datetime.now()
         self.updated_at = datetime.now()
-        self.processed_file_path = None
+        self.processed_excel_binary = None  # Binary data for processed Excel
         self.error_message = None
         self.results = []
 
@@ -89,16 +82,17 @@ class JobRecord:
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "processed_file_path": self.processed_file_path,
+            "processed_excel_binary": self.processed_excel_binary,
             "error_message": self.error_message,
             "results": self.results
         }
 
 # Utility functions
-def extract_job_ids_from_excel(file_path: str) -> List[int]:
-    """Extract job_id values from Excel file"""
+def extract_job_ids_from_excel(file_content: bytes) -> List[int]:
+    """Extract job_id values from Excel file content"""
     try:
-        df = pd.read_excel(file_path)
+        # Read Excel from bytes
+        df = pd.read_excel(io.BytesIO(file_content))
         
         if 'job_id' not in df.columns:
             raise ValueError("Excel file must contain a 'job_id' column")
@@ -163,8 +157,8 @@ async def fetch_todo_data(job_id: int) -> Dict[str, Any]:
             "data": {"error": str(e)}
         }
 
-def create_processed_excel(results: List[Dict], output_path: str):
-    """Create processed Excel file with results"""
+def create_processed_excel(results: List[Dict]) -> bytes:
+    """Create processed Excel file with results and return as bytes"""
     try:
         # Prepare data for Excel
         excel_data = []
@@ -198,11 +192,14 @@ def create_processed_excel(results: List[Dict], output_path: str):
                     "api_response": str(data)
                 })
         
-        # Create DataFrame and save to Excel
+        # Create DataFrame and save to Excel in memory
         df = pd.DataFrame(excel_data)
-        df.to_excel(output_path, index=False, engine='openpyxl')
+        output = io.BytesIO()
+        df.to_excel(output, index=False, engine='openpyxl')
+        output.seek(0)
         
-        logger.info(f"Processed Excel file created: {output_path}")
+        logger.info("Processed Excel file created in memory")
+        return output.getvalue()
         
     except Exception as e:
         logger.error(f"Error creating processed Excel file: {str(e)}")
@@ -268,19 +265,16 @@ async def process_job_ids(unique_id: str):
             )
             return
         
-        # Create processed Excel file
-        output_filename = f"processed_{unique_id}.xlsx"
-        output_path = config.PROCESSED_DIR / output_filename
+        # Create processed Excel file in memory
+        processed_excel_bytes = create_processed_excel(processed_results)
         
-        create_processed_excel(processed_results, str(output_path))
-        
-        # Update job record with completion
+        # Update job record with completion and store binary data
         jobs_collection.update_one(
             {"unique_id": unique_id},
             {
                 "$set": {
                     "status": JobStatus.COMPLETED,
-                    "processed_file_path": str(output_path),
+                    "processed_excel_binary": processed_excel_bytes,
                     "results": processed_results,
                     "updated_at": datetime.now()
                 }
@@ -322,17 +316,13 @@ async def upload_excel_file(file: UploadFile = File(...)):
     unique_id = str(uuid.uuid4())
     
     try:
-        # Save uploaded file temporarily
-        upload_path = config.UPLOAD_DIR / f"{unique_id}_{file.filename}"
+        # Read file content directly
+        content = await file.read()
         
-        with open(upload_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Extract job IDs from Excel content
+        job_ids = extract_job_ids_from_excel(content)
         
-        # Extract job IDs from Excel
-        job_ids = extract_job_ids_from_excel(str(upload_path))
-        
-        # Store job record in MongoDB
+        # Store job record in MongoDB (without storing original file)
         job_record = JobRecord(unique_id=unique_id, job_ids=job_ids)
         jobs_collection.insert_one(job_record.to_dict())
         
@@ -347,9 +337,6 @@ async def upload_excel_file(file: UploadFile = File(...)):
         )
         
         logger.info(f"Scheduled job {unique_id} to run at {run_time}")
-        
-        # Clean up uploaded file
-        upload_path.unlink()
         
         logger.info(f"Job {unique_id} created with {len(job_ids)} job IDs")
         
@@ -420,18 +407,19 @@ async def download_processed_file(unique_id: str):
             detail="Job is not completed yet"
         )
     
-    file_path = job_record.get("processed_file_path")
-    if not file_path or not Path(file_path).exists():
+    processed_excel_binary = job_record.get("processed_excel_binary")
+    if not processed_excel_binary:
         raise HTTPException(
             status_code=404, 
             detail="Processed file not found"
         )
     
     filename = f"processed_results_{unique_id}.xlsx"
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    
+    return Response(
+        content=processed_excel_binary,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 @app.get("/jobs",
@@ -456,11 +444,7 @@ async def delete_job(unique_id: str):
     if not job_record:
         raise HTTPException(status_code=404, detail="Job ID not found")
     
-    # Delete processed file if exists
-    if job_record.get("processed_file_path"):
-        file_path = Path(job_record["processed_file_path"])
-        if file_path.exists():
-            file_path.unlink()
+    # No need to delete files since we're not storing them separately
     
     # Delete from MongoDB
     jobs_collection.delete_one({"unique_id": unique_id})
